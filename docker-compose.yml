@@ -1,0 +1,3 @@
+# docker-compose.yml - Hedef Test Ortamı (Target Lab)
+# AI ajanının üzerinde güvenlik testleri yapacağı zafiyetli hedef sistemin (web uygulaması/sunucu) Docker yapılandırmasıdır.
+# Test edilecek kurban sistem bu dosya üzerinden ayağa kaldırılır.
