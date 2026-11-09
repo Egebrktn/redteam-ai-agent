@@ -1,0 +1,12 @@
+# Gizli anahtarlar
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Editör
+.vscode/
+.idea/

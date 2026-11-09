@@ -1,3 +1,53 @@
 # docker-compose.yml - Hedef Test Ortamı (Target Lab)
 # AI ajanının üzerinde güvenlik testleri yapacağı zafiyetli hedef sistemin (web uygulaması/sunucu) Docker yapılandırmasıdır.
 # Test edilecek kurban sistem bu dosya üzerinden ayağa kaldırılır.
+services:
+  # --- AI Sızma Testi Ajanı (main.py / tools.py) ---
+  agent:
+    build: .
+    container_name: redteam-agent
+    env_file:
+      - .env
+    environment:
+      # Ajanın hedeflere konteyner adıyla ulaşması için:
+      DVWA_URL: "http://dvwa:80"
+      JUICESHOP_URL: "http://juiceshop:3000"
+    volumes:
+      # Kodu canlı düzenleyebilmek için (geliştirme kolaylığı):
+      - ./:/app
+    depends_on:
+      - dvwa
+      - juiceshop
+    networks:
+      - redteam-net
+    # Ajan sürekli çalışan bir servis değilse, çökünce yeniden başlamasın:
+    restart: "no"
+
+  # --- Hedef 1: DVWA (SQLi, Command Injection için) ---
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    container_name: dvwa-target
+    # Tarayıcıdan da bakmak istersen diye dışarı açtık; istemezsen bu 2 satırı sil.
+    ports:
+      - "8080:80"
+    networks:
+      - redteam-net
+    restart: unless-stopped
+
+  # --- Hedef 2: OWASP Juice Shop (IDOR, Auth Bypass için) ---
+  juiceshop:
+    image: bkimminich/juice-shop:latest
+    container_name: juiceshop-target
+    ports:
+      - "3000:3000"
+    networks:
+      - redteam-net
+    restart: unless-stopped
+
+networks:
+  redteam-net:
+    driver: bridge
+    # Hedefleri dış dünyadan izole etmek istersen alttaki satırı aç.
+    # Ama o zaman agent da internete (OpenAI API) çıkamaz; o yüzden
+    # şimdilik kapalı bırakıyoruz.
+    # internal: true
