@@ -3,11 +3,13 @@
 # Orchestrator AI burada çalışır, tools.py içindeki araçlardan hangisini kullanacağına karar verir.
 # Tüm test adımları bittiğinde toplanan çıktıları Reporter AI'a göndererek nihai güvenlik raporunu üretir.
 
+import inspect
 import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
@@ -16,7 +18,82 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 
-from tools import TOOL_MAP, TOOLS_DESCRIPTION
+import tools
+
+# ---------------------------------------------------------------------------
+# 0. External Contract & Automatic Adapter for tools.py
+# ---------------------------------------------------------------------------
+def _make_json_tool_adapter(fn: Callable[[str], str]) -> Callable[..., str]:
+    """
+    Wraps a tools.py function that expects a single `input_json: str` parameter
+    so that it can be invoked seamlessly via `tool_callable(**tool_args)`.
+    """
+    sig = inspect.signature(fn)
+    params = list(sig.parameters.values())
+
+    def _wrapped(**kwargs: Any) -> str:
+        # If the underlying function takes a single `input_json` string (like Ceyda's tools.py)
+        if len(params) == 1 and params[0].kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            # If LLM already passed {"input_json": "..."}
+            if "input_json" in kwargs and len(kwargs) == 1 and isinstance(kwargs["input_json"], str):
+                return fn(kwargs["input_json"])
+            return fn(json.dumps(kwargs, ensure_ascii=False))
+        # Otherwise call directly with keyword arguments
+        return fn(**kwargs)
+
+    return _wrapped
+
+
+if hasattr(tools, "TOOL_MAP") and hasattr(tools, "TOOLS_DESCRIPTION"):
+    from tools import TOOL_MAP, TOOLS_DESCRIPTION  # type: ignore[attr-defined]
+else:
+    # Build TOOL_MAP & TOOLS_DESCRIPTION dynamically from tools.py functions
+    _RAW_TOOLS: list[str] = [
+        "validate_target",
+        "discover_endpoints",
+        "analyze_http_response",
+        "check_security_headers",
+        "check_cors",
+        "check_cookie_security",
+        "check_sql_injection",
+        "check_command_injection",
+        "check_idor",
+        "check_authentication",
+        "check_sensitive_disclosure",
+    ]
+    TOOL_MAP: dict[str, Callable[..., str]] = {
+        name: _make_json_tool_adapter(getattr(tools, name))
+        for name in _RAW_TOOLS
+        if hasattr(tools, name)
+    }
+    TOOLS_DESCRIPTION: str = """
+- validate_target: Hedef URL, protokol ve kapsam doğrulaması yapar (İlk adımda çağrılmalıdır).
+  Args: {"url": "<target_url>", "allowed_hosts": ["<hostname>"]}
+- discover_endpoints: Hedef üzerindeki erişilebilir web/API uç noktalarını (endpoint) keşfeder.
+  Args: {"base_url": "<target_url>", "allowed_hosts": ["<hostname>"], "wordlist": ["api", "admin", "login", "rest", "ftp", "metrics"]}
+- analyze_http_response: Belirtilen URL'nin HTTP durum kodu, başlıkları ve yanıt davranışını analiz eder.
+  Args: {"url": "<endpoint_url>", "method": "GET", "allowed_hosts": ["<hostname>"]}
+- check_security_headers: Eksik veya hatalı yapılandırılmış HTTP güvenlik başlıklarını (CSP, HSTS, X-Frame-Options vb.) denetler.
+  Args: {"url": "<target_url>", "allowed_hosts": ["<hostname>"]}
+- check_cors: CORS yapılandırmasını ve güvensiz Origin politikalarını kontrol eder.
+  Args: {"url": "<target_url>", "allowed_hosts": ["<hostname>"]}
+- check_cookie_security: Çerezlerin Secure, HttpOnly ve SameSite bayraklarını inceler.
+  Args: {"url": "<target_url>", "allowed_hosts": ["<hostname>"]}
+- check_sql_injection: Parametreler üzerinde güvenli ve yıkıcı olmayan SQL Injection doğrulaması yapar.
+  Args: {"url": "<endpoint_url>", "method": "GET", "parameters": {"id": "1"}, "allowed_hosts": ["<hostname>"]}
+- check_command_injection: Parametreler üzerinde güvenli Command Injection doğrulaması yapar.
+  Args: {"url": "<endpoint_url>", "method": "GET", "parameters": {"host": "127.0.0.1"}, "allowed_hosts": ["<hostname>"]}
+- check_idor: Yetkilendirme ve IDOR kontrollerini test eder.
+  Args: {"url": "<endpoint_url_with_{id}>", "account_a": {"id": "1", "token": ""}, "account_b": {"id": "2", "token": ""}, "allowed_hosts": ["<hostname>"]}
+- check_authentication: Korunan bir uç noktada kimlik doğrulama ve JWT/Token davranışını denetler.
+  Args: {"protected_url": "<endpoint_url>", "allowed_hosts": ["<hostname>"]}
+- check_sensitive_disclosure: HTTP yanıt gövdesinde sızdırılmış hassas bilgileri (anahtarlar, stack trace, iç IP, e-posta) tarar.
+  Args: {"url": "<endpoint_url>", "allowed_hosts": ["<hostname>"]}
+""".strip()
+
 
 # ---------------------------------------------------------------------------
 # 1. Setup & Configuration
@@ -51,25 +128,29 @@ client = OpenAI(
 def build_orchestrator_system_prompt(target_url: str) -> str:
     """Constructs the system prompt enforcing the JSON ReAct schema."""
     available_tool_names = ", ".join(TOOL_MAP.keys())
+    parsed_host = urlparse(target_url).hostname or "127.0.0.1"
     return (
-        "You are an autonomous Security Analysis Orchestrator Agent performing a "
+        "You are an autonomous Security Analysis Orchestrator Agent performing an "
         "authorized security posture and misconfiguration assessment.\n\n"
-        f"TARGET URL: {target_url}\n\n"
+        f"TARGET URL: {target_url}\n"
+        f"AUTHORIZED HOST: {parsed_host}\n\n"
         "AVAILABLE TOOLS:\n"
         f"{TOOLS_DESCRIPTION}\n"
         f"Registered tool identifiers in TOOL_MAP: [{available_tool_names}]\n\n"
         "INSTRUCTIONS:\n"
         "1. Analyze the target step-by-step using the ReAct (Reasoning + Acting) paradigm.\n"
-        "2. At each step, decide which single tool to run next, or choose 'FINISH' when "
+        "2. Start by validating the target (`validate_target`), then discover endpoints and check security headers, CORS, cookies, disclosure, and relevant endpoint checks.\n"
+        "3. At each step, decide which single tool to run next, or choose 'FINISH' when "
         "sufficient diagnostic information has been gathered.\n"
-        "3. Avoid repeating identical tool calls with the same arguments.\n"
-        "4. You MUST respond ONLY with a valid JSON object matching the exact schema below:\n\n"
+        f"4. Always include `\"allowed_hosts\": [\"{parsed_host}\"]` in `args` when calling tools.\n"
+        "5. Avoid repeating identical tool calls with the same arguments.\n"
+        "6. You MUST respond ONLY with a valid JSON object matching the exact schema below:\n\n"
         "{\n"
         '  "thought": "Detailed reasoning about the current state, previous findings, and next step",\n'
         '  "tool": "Exact tool name from TOOL_MAP or \'FINISH\'",\n'
         '  "args": {"key": "value"}\n'
         "}\n\n"
-        "When setting \"tool\" to \"FINISH\", set \"args\" to an empty object {}."
+        'When setting "tool" to "FINISH", set "args" to an empty object {}.'
     )
 
 
@@ -85,6 +166,8 @@ def run_orchestrator(target_url: str, max_steps: int = 8) -> list[dict[str, Any]
         A list of step records containing `step`, `thought`, `tool`, `args`, and `output`.
     """
     execution_history: list[dict[str, Any]] = []
+    parsed_host = urlparse(target_url).hostname or "127.0.0.1"
+
     messages: list[dict[str, str]] = [
         {"role": "system", "content": build_orchestrator_system_prompt(target_url)},
         {
@@ -183,6 +266,17 @@ def run_orchestrator(target_url: str, max_steps: int = 8) -> list[dict[str, Any]
                 }
             )
             break
+
+        # Ensure target URL and allowed_hosts defaults are populated if omitted by LLM
+        if not any(k in tool_args for k in ("url", "target", "base_url", "protected_url")):
+            if tool_name == "discover_endpoints":
+                tool_args["base_url"] = target_url
+            elif tool_name == "check_authentication":
+                tool_args["protected_url"] = target_url
+            else:
+                tool_args["url"] = target_url
+        if "allowed_hosts" not in tool_args and parsed_host:
+            tool_args["allowed_hosts"] = [parsed_host]
 
         # Lookup and execute tool in TOOL_MAP
         if tool_name not in TOOL_MAP:
@@ -316,19 +410,25 @@ def main() -> None:
     console.print(
         Panel(
             "[bold white]İki Aşamalı Güvenlik Analizi AI Ajanı (Orchestrator + Reporter)[/bold white]\n"
-            f"Kullanılan Model: [cyan]{MODEL_NAME}[/cyan]",
+            f"Kullanılan Model: [cyan]{MODEL_NAME}[/cyan]\n"
+            f"Yüklü Araç Sayısı: [cyan]{len(TOOL_MAP)}[/cyan]",
             title="Security Analysis AI Agent",
             border_style="cyan",
         )
     )
 
-    target_url = Prompt.ask(
-        "[bold cyan]Hedef URL'yi girin[/bold cyan]",
-        default="http://127.0.0.1:3000",
-    ).strip()
+    default_target = os.getenv("TARGET_URL") or os.getenv("JUICESHOP_URL") or "http://127.0.0.1:3000"
+
+    if sys.stdin.isatty():
+        target_url = Prompt.ask(
+            "[bold cyan]Hedef URL'yi girin[/bold cyan]",
+            default=default_target,
+        ).strip()
+    else:
+        target_url = default_target
 
     if not target_url:
-        target_url = "http://127.0.0.1:3000"
+        target_url = default_target
 
     console.print(f"\n[bold]Hedef:[/bold] [underline]{target_url}[/underline] üzerinde analiz başlatılıyor...\n")
 
