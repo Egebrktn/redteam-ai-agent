@@ -10,3 +10,5 @@ venv/
 # Editör
 .vscode/
 .idea/
+__pycache__/
+*.py[cod]
